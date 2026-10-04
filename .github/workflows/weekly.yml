@@ -1,0 +1,54 @@
+name: weekly
+
+on:
+  schedule:
+    - cron: "17 13 * * 5" # 週五 21:17（台北）主發
+    - cron: "23 1 * * 6" # 週六 09:23（台北）補查
+  workflow_dispatch:
+    inputs:
+      issue:
+        description: "強制處理指定期數（留空 = 自動偵測新期）"
+        required: false
+
+concurrency:
+  group: weekly
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  send:
+    runs-on: ubuntu-latest # 標準 runner；larger runner 即使公開 repo 也會收費，勿改
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Fetch, convert, publish
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          TELEGRAPH_TOKEN: ${{ secrets.TELEGRAPH_TOKEN }}
+          GITHUB_TOKEN: ${{ github.token }}
+          ISSUE: ${{ inputs.issue }}
+        run: python weekly_tg.py ${ISSUE:+--issue "$ISSUE"}
+
+      - name: Commit state
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add state.json
+          if git diff --cached --quiet; then
+            echo "state unchanged"
+          else
+            git commit -m "chore: update state"
+            git pull --rebase
+            git push
+          fi
