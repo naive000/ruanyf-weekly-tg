@@ -114,6 +114,58 @@ def test_keepalive_due():
     assert w.keepalive_due({"last_checked": "2026-09-01"}, today)
 
 
+def test_parse_range():
+    assert w.parse_range("380-412") == (380, 412)
+    for bad in ("412-380", "380", "a-b", "380-"):
+        with pytest.raises(SystemExit):
+            w.parse_range(bad)
+
+
+def test_flood_retry_waits_then_succeeds(monkeypatch):
+    sleeps, calls = [], {"n": 0}
+    monkeypatch.setattr(w.time, "sleep", sleeps.append)
+
+    def flaky():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("telegraph createPage: FLOOD_WAIT_3")
+        if calls["n"] == 2:
+            raise RuntimeError("telegram sendMessage: HTTP 429 (Too Many Requests: retry after 5)")
+        return "ok"
+
+    assert w.with_flood_retry(flaky) == "ok"
+    assert sleeps == [4, 6]
+
+
+def test_flood_retry_does_not_swallow_other_errors(monkeypatch):
+    monkeypatch.setattr(w.time, "sleep", lambda s: None)
+
+    def bad():
+        raise RuntimeError("telegram sendMessage: HTTP 400 (chat not found)")
+
+    with pytest.raises(RuntimeError, match="chat not found"):
+        w.with_flood_retry(bad)
+
+
+def test_backfill_skips_done_and_continues_after_failure(monkeypatch, tmp_path):
+    state = {"last_issue": 413, "backfilled": [381]}
+    monkeypatch.setattr(w, "STATE_PATH", tmp_path / "state.json")
+    monkeypatch.setattr(w, "list_issue_numbers", lambda: [380, 381, 382, 383])
+    monkeypatch.setattr(w.time, "sleep", lambda s: None)
+    seen = []
+
+    def fake_process(n, args, st):
+        if n == 382:
+            raise RuntimeError("boom")
+        seen.append(n)
+
+    monkeypatch.setattr(w, "process_issue", fake_process)
+    args = w.argparse.Namespace(backfill="380-384", dry_run=False, telegraph_only=False, delay=0)
+    assert w.backfill(args, state) == 1  # 382 失敗
+    assert seen == [380, 383]  # 381 已補發略過、382 失敗不中斷、384 不存在略過
+    assert state["backfilled"] == [381, 380, 383]
+
+
 def test_request_errors_do_not_leak_url(monkeypatch):
     import urllib.error
 

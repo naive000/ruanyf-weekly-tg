@@ -9,6 +9,9 @@ on:
       issue:
         description: "強制處理指定期數（留空 = 自動偵測新期）"
         required: false
+      backfill:
+        description: "補發歷史期數，格式「起-訖」，如 380-412（留空 = 不補發）"
+        required: false
 
 concurrency:
   group: weekly
@@ -20,7 +23,7 @@ permissions:
 jobs:
   send:
     runs-on: ubuntu-latest # 標準 runner；larger runner 即使公開 repo 也會收費，勿改
-    timeout-minutes: 5
+    timeout-minutes: ${{ github.event_name == 'workflow_dispatch' && 20 || 5 }} # 排程 5 分鐘；手動補發 20 分鐘
     steps:
       - uses: actions/checkout@v4
 
@@ -38,9 +41,11 @@ jobs:
           TELEGRAPH_TOKEN: ${{ secrets.TELEGRAPH_TOKEN }}
           GITHUB_TOKEN: ${{ github.token }}
           ISSUE: ${{ inputs.issue }}
-        run: python weekly_tg.py ${ISSUE:+--issue "$ISSUE"}
+          BACKFILL: ${{ inputs.backfill }}
+        run: python weekly_tg.py ${ISSUE:+--issue "$ISSUE"} ${BACKFILL:+--backfill "$BACKFILL"}
 
       - name: Commit state
+        if: always() # 補發中途失敗也要把已完成的進度寫回，避免重跑重複發
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"

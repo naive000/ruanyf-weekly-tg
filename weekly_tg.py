@@ -12,6 +12,7 @@ import json
 import os
 import re
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -57,6 +58,27 @@ def _request(url: str, *, data: bytes | None = None, headers: dict | None = None
         raise RuntimeError(f"{label}: HTTP {e.code}{detail}") from None
     except urllib.error.URLError as e:
         raise RuntimeError(f"{label}: {e.reason}") from None
+
+
+def with_flood_retry(fn, attempts: int = 4):
+    """碰到 Telegraph FLOOD_WAIT_n 或 Telegram 'retry after n' 就等待後重試。"""
+    for i in range(attempts):
+        try:
+            return fn()
+        except RuntimeError as e:
+            m = re.search(r"FLOOD_WAIT_(\d+)|retry after (\d+)", str(e))
+            if not m or i == attempts - 1:
+                raise
+            wait = int(m.group(1) or m.group(2)) + 1
+            print(f"rate limited, sleep {wait}s")
+            time.sleep(wait)
+
+
+def parse_range(spec: str) -> tuple[int, int]:
+    m = re.fullmatch(r"(\d+)-(\d+)", spec)
+    if not m or int(m.group(1)) > int(m.group(2)):
+        raise SystemExit(f"--backfill 格式應為「起-訖」（例如 380-412），收到：{spec}")
+    return int(m.group(1)), int(m.group(2))
 
 
 def github_get(path: str, raw: bool = False) -> bytes:
@@ -343,18 +365,47 @@ def process_issue(n: int, args: argparse.Namespace, state: dict) -> None:
             fd = os.open(args.token_out, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
             with os.fdopen(fd, "w") as f:
                 f.write(token)
-        print(f"telegraph: {telegraph_create_page(token, issue)}")
+        print(f"telegraph: {with_flood_retry(lambda: telegraph_create_page(token, issue))}")
         return
 
     env = _require_env("TG_BOT_TOKEN", "TG_CHAT_ID", "TELEGRAPH_TOKEN")
-    page_url = telegraph_create_page(env["TELEGRAPH_TOKEN"], issue)
+    page_url = with_flood_retry(lambda: telegraph_create_page(env["TELEGRAPH_TOKEN"], issue))
     print(f"telegraph: {page_url}")
-    telegram_send_index(env["TG_BOT_TOKEN"], env["TG_CHAT_ID"], issue, page_url)
+    with_flood_retry(lambda: telegram_send_index(env["TG_BOT_TOKEN"], env["TG_CHAT_ID"], issue, page_url))
     print(f"issue {n}: sent")
     if n > state["last_issue"]:  # 先寫 state 再處理下一期，部分成功也不會重發
         state["last_issue"] = n
     state["last_sent"] = dt.date.today().isoformat()
     save_state(state)
+
+
+def backfill(args: argparse.Namespace, state: dict) -> int:
+    """依序補發 [起, 訖] 期。進度記在 state['backfilled']，中途失敗重跑不會重複發；單期失敗不中斷其他期。"""
+    lo, hi = parse_range(args.backfill)
+    available = set(list_issue_numbers())
+    real_send = not (args.dry_run or args.telegraph_only)
+    failed: list[int] = []
+    for n in range(lo, hi + 1):
+        if n in state.get("backfilled", []):
+            print(f"issue {n}: 已補發過，略過")
+            continue
+        if n not in available:
+            print(f"issue {n}: repo 內不存在，略過")
+            continue
+        try:
+            process_issue(n, args, state)
+        except RuntimeError as e:
+            print(f"issue {n}: FAILED {e}")
+            failed.append(n)
+            continue
+        if real_send:
+            state.setdefault("backfilled", []).append(n)
+            save_state(state)
+            time.sleep(args.delay)
+    if failed:
+        print(f"補發失敗的期數：{failed}")
+        return 1
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -364,6 +415,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--telegraph-only", action="store_true", help="只建 Telegraph 頁，不發 Telegram，不改 state")
     p.add_argument("--token-out", help="--telegraph-only 且無 TELEGRAPH_TOKEN 時，把臨時帳號 token 寫入此檔（0600）")
     p.add_argument("--bootstrap-telegraph", action="store_true", help="建立 Telegraph 帳號並把 token 印到 stdout（用於管線給 gh secret set）")
+    p.add_argument("--backfill", help="補發歷史期數，格式「起-訖」（含兩端），依期數由小到大逐期發送")
+    p.add_argument("--delay", type=float, default=4.0, help="補發時每期之間的間隔秒數（避開頻道每分鐘 20 則上限）")
     args = p.parse_args(argv)
 
     if args.bootstrap_telegraph:
@@ -371,6 +424,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     state = load_state()
+    if args.backfill:
+        return backfill(args, state)
     pending = pick_pending(list_issue_numbers(), state["last_issue"], args.issue)
     today = dt.date.today()
     if not pending:
